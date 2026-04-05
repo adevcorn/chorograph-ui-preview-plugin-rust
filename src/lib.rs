@@ -34,16 +34,23 @@ fn handle_action(action_id: String, payload: serde_json::Value) {
     // We use the symbol list to find files quickly rather than a directory walk.
     let symbols = match workspace_symbols_from_host(&workspace_root) {
         Ok(s) => s,
-        Err(_) => {
-            log!("[ui-preview] workspace symbols unavailable — falling back to root files");
+        Err(e) => {
+            log!(
+                "[ui-preview] workspace symbols error: {:?} — falling back to empty list",
+                e
+            );
             vec![]
         }
     };
+
+    log!("[ui-preview] got {} symbols from host", symbols.len());
 
     // Deduplicate file paths from symbol list.
     let mut paths: Vec<String> = symbols.iter().map(|s| s.file_path.clone()).collect();
     paths.sort();
     paths.dedup();
+
+    log!("[ui-preview] {} unique file paths to scan", paths.len());
 
     let mut found = 0;
 
@@ -113,6 +120,10 @@ fn emit_preview(payload: &UIPreviewPayload) {
                 serde_json::Value::String("uiPreview".to_string()),
             );
             if let Ok(envelope) = serde_json::to_string(&map) {
+                log!(
+                    "[ui-preview] emitting uiPreview event ({} bytes)",
+                    envelope.len()
+                );
                 // Call host_push_ai_event directly with an empty session_id so the
                 // envelope lands in onAiEvent() as the raw eventJson string.
                 unsafe {
