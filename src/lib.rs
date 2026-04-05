@@ -12,9 +12,8 @@ fn init() {
     log!("[ui-preview] plugin loaded");
 }
 
-/// Called after LSP is ready so workspace_symbols_from_host is available.
-/// Scans all source files in the workspace for SwiftUI views and React
-/// components, emits a "uiPreview" event for each one found.
+/// Called after LSP is ready. Scans all Swift/TSX/JSX files under workspaceRoot
+/// using a direct filesystem walk (find subprocess) — does not rely on LSP symbols.
 #[chorograph_plugin]
 fn handle_action(action_id: String, payload: serde_json::Value) {
     if action_id != "identifyUIComponents" {
@@ -22,7 +21,6 @@ fn handle_action(action_id: String, payload: serde_json::Value) {
     }
 
     let workspace_root = payload["workspaceRoot"].as_str().unwrap_or("").to_string();
-
     if workspace_root.is_empty() {
         log!("[ui-preview] identifyUIComponents: no workspaceRoot in payload");
         return;
@@ -30,30 +28,10 @@ fn handle_action(action_id: String, payload: serde_json::Value) {
 
     log!("[ui-preview] scanning {} for UI components", workspace_root);
 
-    // Collect candidate file paths via workspace symbols.
-    // We use the symbol list to find files quickly rather than a directory walk.
-    let symbols = match workspace_symbols_from_host(&workspace_root) {
-        Ok(s) => s,
-        Err(e) => {
-            log!(
-                "[ui-preview] workspace symbols error: {:?} — falling back to empty list",
-                e
-            );
-            vec![]
-        }
-    };
-
-    log!("[ui-preview] got {} symbols from host", symbols.len());
-
-    // Deduplicate file paths from symbol list.
-    let mut paths: Vec<String> = symbols.iter().map(|s| s.file_path.clone()).collect();
-    paths.sort();
-    paths.dedup();
-
-    log!("[ui-preview] {} unique file paths to scan", paths.len());
+    let paths = find_source_files(&workspace_root);
+    log!("[ui-preview] find returned {} candidate files", paths.len());
 
     let mut found = 0;
-
     for path in &paths {
         let ext = path.rsplit('.').next().unwrap_or("");
         match ext {
@@ -74,6 +52,91 @@ fn handle_action(action_id: String, payload: serde_json::Value) {
     }
 
     log!("[ui-preview] found {} UI component file(s)", found);
+}
+
+// ---------------------------------------------------------------------------
+// File discovery via `find` subprocess
+// ---------------------------------------------------------------------------
+
+fn find_source_files(root: &str) -> Vec<String> {
+    // find <root> -type f \( -name "*.swift" -o -name "*.tsx" -o -name "*.jsx" \)
+    // Exclude common noise dirs: .build, node_modules, .git, DerivedData, Pods
+    let proc = match ChildProcess::spawn(
+        "find",
+        vec![
+            root,
+            "-type",
+            "f",
+            "(",
+            "-name",
+            "*.swift",
+            "-o",
+            "-name",
+            "*.tsx",
+            "-o",
+            "-name",
+            "*.jsx",
+            ")",
+            "-not",
+            "-path",
+            "*/.build/*",
+            "-not",
+            "-path",
+            "*/node_modules/*",
+            "-not",
+            "-path",
+            "*/.git/*",
+            "-not",
+            "-path",
+            "*/DerivedData/*",
+            "-not",
+            "-path",
+            "*/Pods/*",
+            "-not",
+            "-path",
+            "*/build/*",
+        ],
+        Some(root),
+        std::collections::HashMap::new(),
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            log!("[ui-preview] find spawn failed: {:?}", e);
+            return vec![];
+        }
+    };
+
+    // Collect stdout with a generous timeout loop
+    let mut output = Vec::new();
+    loop {
+        if proc.wait_for_data(2000) {
+            match proc.read(PipeType::Stdout) {
+                Ok(ReadResult::Data(bytes)) => output.extend_from_slice(&bytes),
+                Ok(ReadResult::EOF) => break,
+                Ok(ReadResult::Empty) => {}
+                Err(_) => break,
+            }
+        } else {
+            // Check if the process has finished even if wait_for_data timed out
+            match proc.get_status() {
+                ProcessStatus::Running => continue,
+                _ => break,
+            }
+        }
+    }
+    // Drain any remaining buffered output after exit
+    loop {
+        match proc.read(PipeType::Stdout) {
+            Ok(ReadResult::Data(bytes)) => output.extend_from_slice(&bytes),
+            _ => break,
+        }
+    }
+
+    String::from_utf8_lossy(&output)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_string())
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -110,8 +173,6 @@ fn scan_react_file(path: &str) -> Option<UIPreviewPayload> {
 
 fn emit_preview(payload: &UIPreviewPayload) {
     if let Ok(json) = serde_json::to_string(payload) {
-        // Inject "type":"uiPreview" into the serialised object so TelemetryManager
-        // can identify it via json["type"].
         if let Ok(mut map) =
             serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&json)
         {
@@ -121,11 +182,10 @@ fn emit_preview(payload: &UIPreviewPayload) {
             );
             if let Ok(envelope) = serde_json::to_string(&map) {
                 log!(
-                    "[ui-preview] emitting uiPreview event ({} bytes)",
+                    "[ui-preview] emitting uiPreview for {} ({} bytes)",
+                    payload.file_path,
                     envelope.len()
                 );
-                // Call host_push_ai_event directly with an empty session_id so the
-                // envelope lands in onAiEvent() as the raw eventJson string.
                 unsafe {
                     ffi::host_push_ai_event(
                         "".as_ptr(),
