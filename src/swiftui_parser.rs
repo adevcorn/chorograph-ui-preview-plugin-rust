@@ -5,6 +5,7 @@
 /// 2. For each such struct, walk the body line-by-line tracking brace depth.
 /// 3. Emit component nodes for known SwiftUI types, inferring label from the first
 ///    string literal argument or the variable name on the left side of `=`.
+/// 4. For interactive nodes (Button, Toggle, etc.) extract the action handler.
 use crate::model::{UIPreviewCategory, UIPreviewNode};
 
 // ---------------------------------------------------------------------------
@@ -13,7 +14,6 @@ use crate::model::{UIPreviewCategory, UIPreviewNode};
 
 struct ComponentInfo {
     category: UIPreviewCategory,
-    /// True if this is a container that can hold children (increases depth expectation).
     is_container: bool,
 }
 
@@ -74,13 +74,8 @@ fn classify(type_name: &str) -> Option<ComponentInfo> {
 pub fn parse_swiftui(source: &str) -> Option<UIPreviewNode> {
     let lines: Vec<&str> = source.lines().collect();
 
-    // Find the first struct / class declaration that conforms to View.
     let (struct_name, body_start) = find_view_struct(&lines)?;
-
-    // Walk the body and build a flat list of (depth, component) pairs.
     let components = extract_components(&lines, body_start);
-
-    // Build the tree from the flat list.
     let root_children = build_tree(&components, 0).0;
 
     Some(UIPreviewNode {
@@ -88,6 +83,8 @@ pub fn parse_swiftui(source: &str) -> Option<UIPreviewNode> {
         category: UIPreviewCategory::Container,
         label: None,
         children: root_children,
+        source_line: Some((body_start + 1) as u32),
+        action_handler: None,
     })
 }
 
@@ -99,13 +96,11 @@ pub fn parse_swiftui(source: &str) -> Option<UIPreviewNode> {
 fn find_view_struct(lines: &[&str]) -> Option<(String, usize)> {
     for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
-        // Match `struct Foo: View` or `struct Foo: SomeProtocol, View`
         if (trimmed.starts_with("struct ") || trimmed.starts_with("class "))
             && (trimmed.contains(": View")
                 || trimmed.contains(": some View")
                 || trimmed.contains(", View"))
         {
-            // Extract the struct name.
             let after_keyword = trimmed
                 .trim_start_matches("struct ")
                 .trim_start_matches("class ");
@@ -115,7 +110,6 @@ fn find_view_struct(lines: &[&str]) -> Option<(String, usize)> {
                 .unwrap_or("View")
                 .to_string();
 
-            // Find the opening brace (may be on the same line or next).
             let brace_line = if trimmed.contains('{') {
                 i
             } else {
@@ -137,30 +131,33 @@ struct FlatEntry {
     r#type: String,
     label: Option<String>,
     category: UIPreviewCategory,
+    /// 1-based line number in the source file.
+    source_line: u32,
+    /// Extracted action handler for interactive nodes.
+    action_handler: Option<String>,
 }
 
 fn extract_components(lines: &[&str], start: usize) -> Vec<FlatEntry> {
     let mut entries = Vec::new();
-    // depth tracks brace nesting relative to the opening brace of the view body.
-    // We start *inside* the body so the first { is already consumed.
     let mut depth: i32 = 0;
     let mut inside = false;
 
-    for line in &lines[start..] {
+    for (offset, line) in lines[start..].iter().enumerate() {
+        let abs_line = start + offset; // 0-based absolute line index
         let trimmed = line.trim();
 
         for ch in trimmed.chars() {
             match ch {
                 '{' => {
                     if !inside {
-                        inside = true; // consume the struct's own opening brace
+                        inside = true;
                     } else {
                         depth += 1;
                     }
                 }
                 '}' => {
                     if depth == 0 {
-                        return entries; // end of the view body
+                        return entries;
                     }
                     depth -= 1;
                 }
@@ -172,8 +169,6 @@ fn extract_components(lines: &[&str], start: usize) -> Vec<FlatEntry> {
             continue;
         }
 
-        // Try to detect a component invocation on this line.
-        // Pattern: optional leading whitespace + TypeName( or TypeName {
         let token = trimmed
             .split(|c: char| c == '(' || c == '{' || c == ' ')
             .next()
@@ -182,11 +177,18 @@ fn extract_components(lines: &[&str], start: usize) -> Vec<FlatEntry> {
 
         if let Some(info) = classify(token) {
             let label = extract_label(trimmed);
+            let action_handler = if info.category == UIPreviewCategory::Interactive {
+                extract_swiftui_action(trimmed, lines, abs_line)
+            } else {
+                None
+            };
             entries.push(FlatEntry {
                 depth: depth as usize,
                 r#type: token.to_string(),
                 label,
                 category: info.category,
+                source_line: (abs_line + 1) as u32, // 1-based
+                action_handler,
             });
         }
     }
@@ -194,9 +196,7 @@ fn extract_components(lines: &[&str], start: usize) -> Vec<FlatEntry> {
 }
 
 /// Extract a display label from a component invocation line.
-/// Strategy: grab the first double-quoted string literal argument.
 fn extract_label(line: &str) -> Option<String> {
-    // Find the first `"..."` in the line.
     let start = line.find('"')?;
     let rest = &line[start + 1..];
     let end = rest.find('"')?;
@@ -208,8 +208,78 @@ fn extract_label(line: &str) -> Option<String> {
     }
 }
 
+/// Extract an action handler expression from a SwiftUI interactive component.
+///
+/// Handles:
+///   Button("Save") { viewModel.save() }         → "viewModel.save()"
+///   Button("OK", action: self.submit)            → "self.submit"
+///   Button(action: { handleTap() }) { ... }      → "handleTap()"
+///   Toggle(isOn: $flag) { ... }                  → no handler (binding, not action)
+fn extract_swiftui_action(line: &str, lines: &[&str], line_idx: usize) -> Option<String> {
+    // Pattern 1: named `action:` parameter  →  Button("x", action: self.foo)
+    if let Some(pos) = line.find("action:") {
+        let after = line[pos + 7..].trim();
+        // Could be a closure `{ ... }` or a reference `self.foo`
+        if after.starts_with('{') {
+            // inline closure — extract first expression inside braces
+            let inner = after.trim_start_matches('{').trim();
+            let expr: String = inner
+                .chars()
+                .take_while(|&c| c != '}' && c != '\n')
+                .collect();
+            let expr = expr.trim().to_string();
+            if !expr.is_empty() {
+                return Some(expr);
+            }
+        } else {
+            // reference: `self.foo` or `viewModel.bar`
+            let expr: String = after
+                .chars()
+                .take_while(|&c| c != ')' && c != ',' && c != '\n' && c != ' ')
+                .collect();
+            if !expr.is_empty() {
+                return Some(expr);
+            }
+        }
+    }
+
+    // Pattern 2: trailing closure on the same line  →  Button("Save") { viewModel.save() }
+    if let Some(open) = line.rfind('{') {
+        let after = &line[open + 1..];
+        if let Some(close) = after.find('}') {
+            let expr = after[..close].trim().to_string();
+            if !expr.is_empty() && !expr.starts_with("Text") && !expr.starts_with("Label") {
+                return Some(expr);
+            }
+        }
+    }
+
+    // Pattern 3: trailing closure on the *next* non-empty line
+    //   Button("Save") {
+    //       viewModel.save()     ← peek here
+    //   }
+    if line.trim_end().ends_with('{') {
+        for peek in &lines[line_idx + 1..line_idx + 4] {
+            let t = peek.trim();
+            if t.is_empty() {
+                continue;
+            }
+            if t == "}" {
+                break;
+            }
+            // First non-empty, non-brace line is the action body
+            let expr: String = t.chars().take_while(|&c| c != '\n').collect();
+            let expr = expr.trim().to_string();
+            if !expr.is_empty() {
+                return Some(expr);
+            }
+        }
+    }
+
+    None
+}
+
 /// Recursively group flat entries into a tree.
-/// Returns (children, next_index).
 fn build_tree(entries: &[FlatEntry], base_depth: usize) -> (Vec<UIPreviewNode>, usize) {
     let mut nodes = Vec::new();
     let mut i = 0;
@@ -220,7 +290,6 @@ fn build_tree(entries: &[FlatEntry], base_depth: usize) -> (Vec<UIPreviewNode>, 
             break;
         }
         if entry.depth == base_depth {
-            // Collect children that are deeper.
             let child_entries = &entries[i + 1..];
             let (children, consumed) = build_tree(child_entries, base_depth + 1);
             nodes.push(UIPreviewNode {
@@ -228,10 +297,11 @@ fn build_tree(entries: &[FlatEntry], base_depth: usize) -> (Vec<UIPreviewNode>, 
                 category: entry.category.clone(),
                 label: entry.label.clone(),
                 children,
+                source_line: Some(entry.source_line),
+                action_handler: entry.action_handler.clone(),
             });
             i += 1 + consumed;
         } else {
-            // Deeper than expected — skip (already consumed by a recursive call).
             i += 1;
         }
     }

@@ -106,6 +106,8 @@ pub fn parse_react(source: &str) -> Option<UIPreviewNode> {
         category: UIPreviewCategory::Container,
         label: None,
         children: root_children,
+        source_line: Some((body_start + 1) as u32),
+        action_handler: None,
     })
 }
 
@@ -178,17 +180,58 @@ fn find_jsx_return(lines: &[&str], from: usize) -> Option<usize> {
     None
 }
 
+/// Extract an action handler identifier from a JSX tag string.
+/// Looks for `onClick={...}`, `onPress={...}`, `onChange={...}`,
+/// `onSubmit={...}`, `onValueChange={...}`.
+fn extract_jsx_handler(tag_str: &str) -> Option<String> {
+    for prop in &[
+        "onClick",
+        "onPress",
+        "onChange",
+        "onSubmit",
+        "onValueChange",
+        "onChangeText",
+        "onBlur",
+        "onFocus",
+    ] {
+        let pattern = format!("{}={{", prop);
+        if let Some(start) = tag_str.find(&pattern) {
+            let rest = &tag_str[start + pattern.len()..];
+            // Extract the expression inside { ... }.
+            // Handle simple identifiers: {handleFoo} or {props.onFoo}
+            // Also arrow functions: {() => doSomething()} → extract "doSomething"
+            let inner: String = rest.chars().take_while(|&c| c != '}').collect();
+            let inner = inner.trim();
+            if inner.is_empty() {
+                continue;
+            }
+            // Arrow function: strip leading `() => ` / `(e) => ` etc.
+            let handler = if let Some(arrow_pos) = inner.find("=>") {
+                inner[arrow_pos + 2..].trim().to_string()
+            } else {
+                inner.to_string()
+            };
+            let handler = handler.trim_matches(|c: char| c == ' ' || c == '{' || c == '}');
+            if !handler.is_empty() {
+                return Some(handler.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Parse JSX tags from `start_line` onward, building a component tree.
 /// We track JSX tag nesting via a stack.
 fn parse_jsx_block(lines: &[&str], start: usize) -> Vec<UIPreviewNode> {
-    // Stack of (tag_name, children_so_far).
-    let mut stack: Vec<(String, Vec<UIPreviewNode>)> = Vec::new();
+    // Stack of (tag_name, children_so_far, source_line_1based).
+    let mut stack: Vec<(String, Vec<UIPreviewNode>, u32)> = Vec::new();
     // The outermost children (returned when stack is empty again).
     let mut root: Vec<UIPreviewNode> = Vec::new();
     // Simple brace depth to detect end of return block.
     let mut paren_depth: i32 = 0;
 
-    for line in &lines[start..] {
+    for (line_offset, line) in lines[start..].iter().enumerate() {
+        let abs_line = (start + line_offset + 1) as u32; // 1-based
         let trimmed = line.trim();
 
         // Track parenthesis depth for the return ( ... ) wrapper.
@@ -216,12 +259,14 @@ fn parse_jsx_block(lines: &[&str], start: usize) -> Vec<UIPreviewNode> {
                     // Closing tag — pop the stack.
                     let tag = extract_close_tag(rest);
                     if !tag.is_empty() {
-                        if let Some((popped_name, children)) = stack.pop() {
+                        if let Some((popped_name, children, open_line)) = stack.pop() {
                             let node = UIPreviewNode {
                                 r#type: popped_name,
                                 category: classify_jsx(&tag),
                                 label: None,
                                 children,
+                                source_line: Some(open_line),
+                                action_handler: None,
                             };
                             if let Some(parent) = stack.last_mut() {
                                 parent.1.push(node);
@@ -240,12 +285,15 @@ fn parse_jsx_block(lines: &[&str], start: usize) -> Vec<UIPreviewNode> {
                     let (tag, self_closing) = extract_open_tag(rest);
                     if !tag.is_empty() && tag != "!" {
                         let label = extract_jsx_text_prop(rest);
+                        let action_handler = extract_jsx_handler(rest);
                         if self_closing {
                             let node = UIPreviewNode {
                                 r#type: tag.clone(),
                                 category: classify_jsx(&tag),
                                 label,
                                 children: vec![],
+                                source_line: Some(abs_line),
+                                action_handler,
                             };
                             if let Some(parent) = stack.last_mut() {
                                 parent.1.push(node);
@@ -254,7 +302,7 @@ fn parse_jsx_block(lines: &[&str], start: usize) -> Vec<UIPreviewNode> {
                             }
                         } else {
                             let tag_len = tag.len();
-                            stack.push((tag, vec![]));
+                            stack.push((tag, vec![], abs_line));
                             pos += tag_len + 1;
                             continue;
                         }

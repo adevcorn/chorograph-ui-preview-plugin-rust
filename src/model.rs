@@ -17,6 +17,12 @@ pub struct UIPreviewNode {
     pub category: UIPreviewCategory,
     pub label: Option<String>,
     pub children: Vec<UIPreviewNode>,
+    /// 1-based source line where this component is declared.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_line: Option<u32>,
+    /// Extracted action handler name/expression, e.g. "viewModel.save()" or "handleSubmit".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_handler: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
