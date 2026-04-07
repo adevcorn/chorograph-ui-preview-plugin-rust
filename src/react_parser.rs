@@ -223,11 +223,17 @@ fn extract_jsx_handler(tag_str: &str) -> Option<String> {
 /// Parse JSX tags from `start_line` onward, building a component tree.
 /// We track JSX tag nesting via a stack.
 fn parse_jsx_block(lines: &[&str], start: usize) -> Vec<UIPreviewNode> {
-    // Stack of (tag_name, children_so_far, source_line_1based).
-    let mut stack: Vec<(String, Vec<UIPreviewNode>, u32)> = Vec::new();
+    // Stack entry: (tag_name, children_so_far, source_line_1based, label, action_handler)
+    let mut stack: Vec<(
+        String,
+        Vec<UIPreviewNode>,
+        u32,
+        Option<String>,
+        Option<String>,
+    )> = Vec::new();
     // The outermost children (returned when stack is empty again).
     let mut root: Vec<UIPreviewNode> = Vec::new();
-    // Simple brace depth to detect end of return block.
+    // Simple paren depth to detect end of return block.
     let mut paren_depth: i32 = 0;
 
     for (line_offset, line) in lines[start..].iter().enumerate() {
@@ -248,25 +254,38 @@ fn parse_jsx_block(lines: &[&str], start: usize) -> Vec<UIPreviewNode> {
             }
         }
 
+        // ── Check for inner text content between tags ──────────────────────
+        // If the stack top is an interactive/display element and this line has
+        // text content (not a tag), capture it as the label.
+        if let Some(top) = stack.last_mut() {
+            if top.3.is_none() {
+                let inner_text = extract_inner_text(trimmed);
+                if let Some(t) = inner_text {
+                    top.3 = Some(t);
+                }
+            }
+        }
+
         // Extract opening and closing JSX tags from the line.
         let mut pos = 0;
         let bytes = trimmed.as_bytes();
         while pos < bytes.len() {
             if bytes[pos] == b'<' {
-                // Skip `{/* comment */}` and `<!` / `<>` / `</>`.
                 let rest = &trimmed[pos..];
                 if rest.starts_with("</") {
                     // Closing tag — pop the stack.
                     let tag = extract_close_tag(rest);
                     if !tag.is_empty() {
-                        if let Some((popped_name, children, open_line)) = stack.pop() {
+                        if let Some((popped_name, children, open_line, label, action_handler)) =
+                            stack.pop()
+                        {
                             let node = UIPreviewNode {
                                 r#type: popped_name,
                                 category: classify_jsx(&tag),
-                                label: None,
+                                label,
                                 children,
                                 source_line: Some(open_line),
-                                action_handler: None,
+                                action_handler, // ← preserved from opening tag
                             };
                             if let Some(parent) = stack.last_mut() {
                                 parent.1.push(node);
@@ -300,13 +319,13 @@ fn parse_jsx_block(lines: &[&str], start: usize) -> Vec<UIPreviewNode> {
                             } else {
                                 root.push(node);
                             }
+                            pos += tag.len() + 1;
                         } else {
-                            let tag_len = tag.len();
-                            stack.push((tag, vec![], abs_line));
-                            pos += tag_len + 1;
+                            // Push tag + preserved label + action_handler onto stack
+                            stack.push((tag, vec![], abs_line, label, action_handler));
+                            pos += 1;
                             continue;
                         }
-                        pos += tag.len() + 1;
                     } else {
                         pos += 1;
                     }
@@ -364,4 +383,25 @@ fn extract_jsx_text_prop(tag_str: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Extract plain inner text content from a line that sits between JSX tags.
+/// e.g. for a line that is just `  Submit` (no `<` characters), returns "Submit".
+/// Skips lines that are JSX expressions `{...}` or are empty.
+fn extract_inner_text(line: &str) -> Option<String> {
+    let t = line.trim();
+    // Must not contain tag characters or be a JSX expression block
+    if t.is_empty() || t.starts_with('<') || t.starts_with('{') || t.starts_with("//") {
+        return None;
+    }
+    // Strip JSX expression wrappers like `{'text'}` or `{"text"}`
+    let clean = t.trim_matches(|c: char| c == '\'' || c == '"');
+    if clean.is_empty() || clean.len() > 60 {
+        return None;
+    }
+    // Reject if it looks like code (contains parens, brackets, semicolons)
+    if clean.contains('(') || clean.contains(';') || clean.contains('=') {
+        return None;
+    }
+    Some(clean.to_string())
 }
